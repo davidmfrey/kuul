@@ -1,6 +1,6 @@
-lib_LTLIBRARIES = libkuul.la
+lib_LTLIBRARIES = libkuhli.la
 
-libkuul_la_SOURCES = kuul.c
-libkuul_la_LIBADD = -lz -lcurl -luv
+libkuhli_la_SOURCES = kuhli.c
+libkuhli_la_LIBADD = -lz -lcurl -luv
 
-include_HEADERS = kuul.h
+include_HEADERS = kuhli.h
