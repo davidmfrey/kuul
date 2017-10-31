@@ -6,14 +6,14 @@
 #include <pthread.h>
 #include <uv.h>
 #include <curl/curl.h>
+#include <stdio.h>
 
-
-struct kuhli_global_s {
+struct kuhli_global_t {
   pthread_t thread;
   uv_loop_t loop;
   CURLM *multi;
   int counter;
-  kuhli_t *active;
+  kuhli_t *kuhli_list;
   union {
     uv_handle_t curl_timer_h;
     uv_timer_t curl_timer;
@@ -52,8 +52,14 @@ typedef struct kuhli_data_s {
   struct kuhli_data_s *next;
 } kuhli_data_t;
 
-struct kuhli_s {
-  kuhli_global *g;
+typedef struct kuhli_header_s {
+  char *key;
+  char *value;
+  struct kuhli_header_s *next;
+} kuhli_header_t;
+
+struct kuhli_t {
+  kuhli_global_t *g;
   kuhli_t *next;
   CURL *easy;
   kuhli_buf_t *querybuf;
@@ -76,14 +82,18 @@ struct kuhli_s {
   char *host;
   char *path;
   int port;
-  struct curl_slist *headers;
-  int closed;
+  struct curl_slist *out_headers;
+  kuhli_header_t *in_headers;
+  int user_ended;
   int paused;
-  int in_progress;
+  int started;
+  int finished;
+
+  FILE *file;
 };
 
 typedef struct kuhli_curl_socket_context_s {
-  kuhli_global *g;
+  kuhli_global_t *g;
   union { 
     uv_handle_t poll_h; 
     uv_poll_t poll;
@@ -91,43 +101,51 @@ typedef struct kuhli_curl_socket_context_s {
   int fd;
 } kuhli_curl_socket_context;
 
-static kuhli_buf_t *init_buf( void ) {
+static kuhli_buf_t *kuhli_buf_init( void ) {
   kuhli_buf_t *b = calloc(sizeof(*b), 1);
   return b;
 }
 
-static void buf_try_grow( kuhli_buf_t *buf, int len ) {
-  if(!buf->max) {
-    buf->max = 8;
+static void kuhli_buf_destroy( kuhli_buf_t *b ) {
+  free(b->buf);
+  free(b);
+}
+
+static void kuhli_buf_clear( kuhli_buf_t *b ) {
+  b->len = 0;
+}
+
+static void kuhli_buf_try_grow( kuhli_buf_t *b, int len ) {
+  if(!b->max) {
+    b->max = 8;
   }
-  if(buf->max - buf->len <= len) {
-    while(buf->max - buf->len <= len) {
-      buf->max *= 2;
+  if(b->max - b->len <= len) {
+    while(b->max - b->len <= len) {
+      b->max *= 2;
     }
-    buf->buf = realloc(buf->buf, buf->max);
+    b->buf = realloc(b->buf, b->max);
   }
 }
 
-static void buf_appendf( kuhli_buf_t *buf, char const *fmt, ... ) {
-  /*  FIXME try to write to buffer if possible instead of calculating length needed first.  */
+static void kuhli_buf_appendf( kuhli_buf_t *b, char const *fmt, ... ) {
   va_list args;
   va_list args2;
   va_start(args, fmt);
   va_copy(args2, args);
   int len = vsnprintf(NULL, 0, fmt, args);
   va_end(args);
-  buf_try_grow(buf, len);
-  vsprintf(buf->buf+buf->len, fmt, args2);
+  kuhli_buf_try_grow(b, len);
+  vsprintf(b->buf+b->len, fmt, args2);
   va_end(args2);
-  buf->len += len;
-  buf->buf[buf->len] = 0;
+  b->len += len;
+  b->buf[b->len] = 0;
 }
 
-static void uv_free_data( uv_handle_t *h ) {
+static void kuhli_uv_free_data( uv_handle_t *h ) {
   free(h->data);
 }
 
-static void add_data_chunk( kuhli_t *k, char const *data, size_t len, int copy ) {
+static void kuhli_add_data_chunk( kuhli_t *k, char const *data, size_t len, int copy ) {
   if(len && data) {
     kuhli_data_t *d = calloc(sizeof(*d), 1);
     if(copy) {
@@ -149,21 +167,21 @@ static void add_data_chunk( kuhli_t *k, char const *data, size_t len, int copy )
   }
 }
 
-static kuhli_t *remove_kuhli_from_active( kuhli_global *g, CURL *easy ) {
-  kuhli_t *res = g->active;
-  if(g->active->easy == easy) {
-    g->active = g->active->next;
+static kuhli_t *kuhli_remove_from_list( kuhli_global_t *g, CURL *easy ) {
+  kuhli_t *res = g->kuhli_list;
+  if(g->kuhli_list->easy == easy) {
+    g->kuhli_list = g->kuhli_list->next;
   }
   else {
     kuhli_t *tmp;
-    for(tmp = g->active; tmp->next->easy != easy; tmp = tmp->next);
+    for(tmp = g->kuhli_list; tmp->next->easy != easy; tmp = tmp->next);
     res = tmp->next;
     tmp->next = tmp->next->next;
   }
   return res;
 }
 
-static void clean_up_finished( kuhli_global *g ) {
+static void kuhli_clean_up_finished( kuhli_global_t *g ) {
   /*  see if any easy handles are complete and wrap them up if so  */
   CURLMsg* message = NULL;
   CURL* easy = NULL;
@@ -171,24 +189,27 @@ static void clean_up_finished( kuhli_global *g ) {
   while((message = curl_multi_info_read(g->multi, &pending ))) {
     if(message->msg == CURLMSG_DONE) {
       easy = message->easy_handle;
-      kuhli_t *k = remove_kuhli_from_active(g, easy);
-      if(k->on_complete) {
-	k->on_complete(k, k->opaque);
-      }
       curl_multi_remove_handle(g->multi, easy);
+      kuhli_t *k = kuhli_remove_from_list(g, easy);
       long status;
-      curl_easy_getinfo(k->easy, CURLINFO_RESPONSE_CODE, &status);
+      curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
+      if(k->on_complete) {
+	k->on_complete(k, status, k->opaque);
+      }
       fprintf(stderr, "Curl status: %ld\n", status);
       fprintf(stderr, "Curl Err: %s\n", k->curl_error_buf);
-      curl_easy_cleanup(k->easy);
-      free(k);
+      k->finished = 1;
     }
   }
 }
 
-static void loop_uv_injection( uv_poll_t *p, int status, int events ) {
+static void kuhli_destroy( kuhli_t *k ) {
+  
+}
+
+static void kuhli_loop_uv_injection( uv_poll_t *p, int status, int events ) {
   /*  somebody outside wants something done!  */
-  kuhli_global *g = p->data;
+  kuhli_global_t *g = p->data;
   kuhli_task_t *tasks[32];
   int num_read = read(g->output, tasks, sizeof(kuhli_task_t *)*32);
   if(num_read) {
@@ -196,29 +217,42 @@ static void loop_uv_injection( uv_poll_t *p, int status, int events ) {
     int i;
     for(i=0; i<num_read; i++) {
       kuhli_task_t *t = tasks[i];
+      kuhli_t *k = t->k;
       switch(t->type) {
       case TASK_START:
-	curl_multi_add_handle(g->multi, t->k->easy);
+	curl_multi_add_handle(g->multi, k->easy);
 	break;
       case TASK_WRITE:
-	add_data_chunk(t->k, t->data, t->data_len, 0);
-	if(t->k->paused) {
-	  //fprintf(stderr, "unpausing easy\n");
-	  t->k->paused = 0;
-	  curl_easy_pause(t->k->easy, CURLPAUSE_CONT);
-	  curl_multi_socket_all(g->multi, &g->counter);
-	  clean_up_finished(g);
+	if(!k->finished) {
+	  kuhli_add_data_chunk(k, t->data, t->data_len, 0);
+	  if(k->paused) {
+	    k->paused = 0;
+	    curl_easy_pause(k->easy, CURLPAUSE_CONT);
+#ifdef USE_CURL_MULTISOCKET_ALL
+	    curl_multi_socket_all(g->multi, &g->counter);
+#else
+	    curl_multi_socket_action(g->multi, CURL_SOCKET_TIMEOUT, 0, &g->counter);
+#endif
+	    kuhli_clean_up_finished(g);
+	  }
 	}
 	break;
       case TASK_END:
-	t->k->closed = 1;
-	if(t->k->paused) {
-	  //fprintf(stderr, "unpausing easy\n");
-	  t->k->paused = 0;
-	  curl_easy_pause(t->k->easy, CURLPAUSE_CONT);
-	  curl_multi_socket_all(g->multi, &g->counter);
-	  //curl_multi_socket_action(g->multi, CURL_SOCKET_TIMEOUT, 0, &g->counter);
-	  clean_up_finished(g);
+	k->user_ended = 1;
+	if(!k->finished) {
+	  if(k->paused) {
+	    k->paused = 0;
+	    curl_easy_pause(k->easy, CURLPAUSE_CONT);
+#ifdef USE_CURL_MULTISOCKET_ALL
+	    curl_multi_socket_all(g->multi, &g->counter);
+#else
+	    curl_multi_socket_action(g->multi, CURL_SOCKET_TIMEOUT, 0, &g->counter);
+#endif
+	    kuhli_clean_up_finished(g);
+	  }
+	}
+	else {
+	  kuhli_destroy(k);
 	}
 	break;
       case TASK_SHUTDOWN:
@@ -228,7 +262,7 @@ static void loop_uv_injection( uv_poll_t *p, int status, int events ) {
   }
 }
 
-static kuhli_curl_socket_context* init_curl_socket_context( kuhli_global * g, curl_socket_t s, CURL* easy) {
+static kuhli_curl_socket_context* kuhli_init_curl_socket_context( kuhli_global_t * g, curl_socket_t s, CURL* easy) {
   kuhli_curl_socket_context * c = calloc(sizeof(*c), 1);
   c->g = g;
   c->fd = s;
@@ -238,69 +272,73 @@ static kuhli_curl_socket_context* init_curl_socket_context( kuhli_global * g, cu
   return c;
 }
 
-static void destroy_curl_socket_context( kuhli_curl_socket_context *c ) {
-  uv_close(&c->poll_h, uv_free_data);
+static void kuhli_destroy_curl_socket_context( kuhli_curl_socket_context *c ) {
+  uv_close(&c->poll_h, kuhli_uv_free_data);
 }
 
-static void loop_uv_socket_action( uv_poll_t* p, int status, int events ) {
+static void kuhli_loop_uv_socket_event( uv_poll_t* p, int status, int events ) {
   /*  libuv says we have some sweet socket action; relay to libcurl  */
   kuhli_curl_socket_context *c = p->data;
-  kuhli_global* g = c->g;
+  kuhli_global_t* g = c->g;
   int flags = ((events & UV_READABLE) ? CURL_CSELECT_IN : 0)|((events & UV_WRITABLE) ? CURL_CSELECT_OUT : 0);
   while(curl_multi_socket_action(g->multi, c->fd, flags, &g->counter) == CURLM_CALL_MULTI_PERFORM);
-  //if(g->counter <= 0 && uv_is_active( &g->curl_timer_h)) {
-  //fprintf(stderr, "Stopping timer\n");
-  //uv_timer_stop(&g->curl_timer);
-  //}
-  clean_up_finished(g);
+  kuhli_clean_up_finished(g);
 }
 
-static int loop_curl_socket( CURL *easy, curl_socket_t s, int action, void *opaque, void *socket_opaque ) {
+static int kuhli_loop_curl_socket( CURL *easy, curl_socket_t s, int action, void *opaque, void *socket_opaque ) {
   /*  libcurl wants to register/deregister events on socket s; set it up with libuv  */
-  kuhli_global* g = opaque;
+  kuhli_global_t* g = opaque;
   kuhli_curl_socket_context* context = NULL;
   if (!(action & CURL_POLL_REMOVE)) {
-    context = socket_opaque ? socket_opaque : init_curl_socket_context(g, s, easy);
+    context = socket_opaque ? socket_opaque : kuhli_init_curl_socket_context(g, s, easy);
     int flags = ((action & CURL_POLL_IN) ? UV_READABLE : 0)|((action & CURL_POLL_OUT) ? UV_WRITABLE : 0);
-    uv_poll_start(&context->poll, flags, loop_uv_socket_action);
+    uv_poll_start(&context->poll, flags, kuhli_loop_uv_socket_event);
   }
   else if((context = socket_opaque)) {
     uv_poll_stop( &context->poll );
-    destroy_curl_socket_context(context);
+    kuhli_destroy_curl_socket_context(context);
   }
   return 0;
 }
 
-static void loop_uv_timeout( uv_timer_t *t ) {
+static void kuhli_loop_uv_timeout( uv_timer_t *t ) {
   /*  libuv says we have a timeout; relay to libcurl  */
-  //fprintf(stderr, "Timeout triggered\n");
-  kuhli_global * g = t->data;
+  kuhli_global_t * g = t->data;
   while (curl_multi_socket_action(g->multi, CURL_SOCKET_TIMEOUT, 0, &g->counter) == CURLM_CALL_MULTI_PERFORM);
-  clean_up_finished(g);
+  kuhli_clean_up_finished(g);
 }
 
-static int loop_curl_set_timer(CURLM* multi, long timeout, void *opaque) {
+static int kuhli_loop_curl_set_timer(CURLM* multi, long timeout, void *opaque) {
   /*  libcurl wants to set a timeout; set it up with libuv  */
-  //fprintf(stderr, "set_timer called with %ld\n", timeout);
-  kuhli_global *g = opaque;
+  kuhli_global_t *g = opaque;
   if(timeout == 0) {
     curl_multi_socket_action(g->multi, CURL_SOCKET_TIMEOUT, 0, &g->counter);
-    clean_up_finished(g);
+    kuhli_clean_up_finished(g);
   }
   else if(timeout == -1) {
     if(uv_is_active(&g->curl_timer_h)) {
-      //fprintf(stderr, "Stopping timer\n");
       uv_timer_stop(&g->curl_timer);
     }
   }
   else {
-    //fprintf(stderr, "Starting timer\n");
-    uv_timer_start(&g->curl_timer, loop_uv_timeout, timeout, 0 );
+    uv_timer_start(&g->curl_timer, kuhli_loop_uv_timeout, timeout, 0 );
   }
   return 0;
 }
 
-static size_t loop_curl_write_body( char *buf, size_t size, size_t num, void *opaque ) {
+static size_t kuhli_loop_curl_header( char *buf, size_t size, size_t num, void *opaque ) {
+  kuhli_t *k = opaque;
+  size_t res = size*num;
+  kuhli_header_t *h = malloc(sizeof(*h)+res+1);
+  h->key = h->value = (char *)(h+1);
+  memcpy(h->key, buf, res);
+  h->key[res] = 0;
+  h->next = k->in_headers;
+  k->in_headers = h;
+  return res;
+}
+
+static size_t kuhli_loop_curl_write_body( char *buf, size_t size, size_t num, void *opaque ) {
   size_t res = size*num;
   for(size_t i=0; i<res; i++) {
     putchar(buf[i]);
@@ -308,7 +346,7 @@ static size_t loop_curl_write_body( char *buf, size_t size, size_t num, void *op
   return res;
 }
 
-static size_t loop_curl_read_body( char *buf, size_t size, size_t num, void *opaque ) {
+static size_t kuhli_loop_curl_read_body( char *buf, size_t size, size_t num, void *opaque ) {
   kuhli_t *k = (kuhli_t *)opaque;
   size_t available_bytes = size*num;
   size_t total_written = 0;
@@ -326,6 +364,9 @@ static size_t loop_curl_read_body( char *buf, size_t size, size_t num, void *opa
       free(tmp);
     }
   }
+  if(total_written) {
+    fwrite(buf, 1, total_written, k->file);
+  }
   if(!k->body) {
     k->tail = NULL;
   }
@@ -338,29 +379,27 @@ static size_t loop_curl_read_body( char *buf, size_t size, size_t num, void *opa
       return 0;
     }
     k->paused = 1;
-    //fprintf(stderr, "pausing easy\n");
     return CURL_READFUNC_PAUSE;
   }
   /*  chunk-encoded body  */
-  if(k->closed) {
+  if(k->user_ended) {
     return 0;
   }
   k->paused = 1;
-  //fprintf(stderr, "pausing easy\n");
   return CURL_READFUNC_PAUSE;
 }
 
-static void *uv_thread( void *arg ) {
+static void *kuhli_uv_thread( void *arg ) {
   /*  spin up a thread and run a loop until it exits  */
-  kuhli_global *g = arg;
+  kuhli_global_t *g = arg;
   uv_run(&g->loop, UV_RUN_DEFAULT);
   while(uv_loop_close(&g->loop) == UV_EBUSY);
   return NULL;
 }
 
-kuhli_global *kuhli_init_global( void ) {
+kuhli_global_t *kuhli_global_init( void ) {
   curl_global_init(CURL_GLOBAL_ALL);
-  kuhli_global *g = calloc(sizeof(*g), 1);
+  kuhli_global_t *g = calloc(sizeof(*g), 1);
   uv_loop_init(&g->loop);
   uv_timer_init(&g->loop, &g->curl_timer);
   g->curl_timer.data = g;
@@ -372,40 +411,40 @@ kuhli_global *kuhli_init_global( void ) {
   g->input = fds[1];
   uv_poll_init(&g->loop, &g->inject, g->output);
   g->inject.data = g;
-  uv_poll_start(&g->inject, UV_READABLE, loop_uv_injection);
+  uv_poll_start(&g->inject, UV_READABLE, kuhli_loop_uv_injection);
   
   g->multi = curl_multi_init();
-  curl_multi_setopt(g->multi, CURLMOPT_SOCKETFUNCTION, loop_curl_socket);
+  curl_multi_setopt(g->multi, CURLMOPT_SOCKETFUNCTION, kuhli_loop_curl_socket);
   curl_multi_setopt(g->multi, CURLMOPT_SOCKETDATA, g);
-  curl_multi_setopt(g->multi, CURLMOPT_TIMERFUNCTION, loop_curl_set_timer);
+  curl_multi_setopt(g->multi, CURLMOPT_TIMERFUNCTION, kuhli_loop_curl_set_timer);
   curl_multi_setopt(g->multi, CURLMOPT_TIMERDATA, g);
   
-  pthread_create(&g->thread, NULL, uv_thread, g);
+  pthread_create(&g->thread, NULL, kuhli_uv_thread, g);
   return g;
 }
 
-void kuhli_cleanup( kuhli_global *g ) {
+void kuhli_global_cleanup( kuhli_global_t *g ) {
   
 }
 
-void kuhli_cleanup_async( kuhli_global *g ) {
+void kuhli_global_cleanup_async( kuhli_global_t *g ) {
   
 }
 
-static kuhli_task_t *init_task( kuhli_t *k, TASK_TYPE type ) {
+static kuhli_task_t *kuhli_init_task( kuhli_t *k, TASK_TYPE type ) {
   kuhli_task_t *t = calloc(sizeof(*t), 1);
   t->type = type;
   t->k = k;
   return t;
 }
 
-static void add_task( kuhli_task_t *t ) {
+static void kuhli_add_task( kuhli_task_t *t ) {
   write(t->k->g->input, &t, sizeof(t));
 }
 
-static void start_request( kuhli_t *k ) {
-  if(!k->in_progress) {
-    k->in_progress = 1;
+static void kuhli_start_request( kuhli_t *k ) {
+  if(!k->started) {
+    k->started = 1;
     k->easy = curl_easy_init();
     if(k->port < 0) {
       k->port = (k->protocol == KUHLI_HTTP) ? 80 : 443;
@@ -413,16 +452,18 @@ static void start_request( kuhli_t *k ) {
     if(!k->path) {
       k->path = strdup("/");
     }
-    buf_appendf(k->buf, "%s://%s:%d%s", 
+    kuhli_buf_appendf(k->buf, "%s://%s:%d%s", 
 		(k->protocol == KUHLI_HTTP) ? "http" : "https", k->host, k->port, k->path);
     if(k->querybuf) {
-      buf_appendf(k->buf, "?%s", k->querybuf->buf);
+      kuhli_buf_appendf(k->buf, "?%s", k->querybuf->buf);
     }
+    curl_easy_setopt(k->easy, CURLOPT_PRIVATE, k);
     curl_easy_setopt(k->easy, CURLOPT_VERBOSE, 1L);
-    curl_easy_setopt(k->easy, CURLOPT_MAX_SEND_SPEED_LARGE, 32000);
     curl_easy_setopt(k->easy, CURLOPT_URL, k->buf->buf);
     curl_easy_setopt(k->easy, CURLOPT_ERRORBUFFER, k->curl_error_buf);
-    curl_easy_setopt(k->easy, CURLOPT_WRITEFUNCTION, loop_curl_write_body);
+    curl_easy_setopt(k->easy, CURLOPT_HEADERFUNCTION, kuhli_loop_curl_header);
+    curl_easy_setopt(k->easy, CURLOPT_HEADERDATA, k);
+    curl_easy_setopt(k->easy, CURLOPT_WRITEFUNCTION, kuhli_loop_curl_write_body);
     curl_easy_setopt(k->easy, CURLOPT_WRITEDATA, NULL );
     switch(k->method) {
     case KUHLI_GET:
@@ -439,7 +480,7 @@ static void start_request( kuhli_t *k ) {
       break;
     }
     if(k->chunked || k->body) {
-      curl_easy_setopt(k->easy, CURLOPT_READFUNCTION, loop_curl_read_body);
+      curl_easy_setopt(k->easy, CURLOPT_READFUNCTION, kuhli_loop_curl_read_body);
       curl_easy_setopt(k->easy, CURLOPT_READDATA, k);
       if(k->chunked) {
 	kuhli_header(k, "Transfer-Encoding", "chunked");
@@ -450,23 +491,24 @@ static void start_request( kuhli_t *k ) {
 	kuhli_header(k, "Content-Length", buf);
       }
     }
-    if(k->headers) {
-      curl_easy_setopt(k->easy, CURLOPT_HTTPHEADER, k->headers );
+    if(k->out_headers) {
+      curl_easy_setopt(k->easy, CURLOPT_HTTPHEADER, k->out_headers );
     }
-    add_task(init_task(k, TASK_START));
+    kuhli_add_task(kuhli_init_task(k, TASK_START));
   }
 }
 
-kuhli_t *kuhli_init( kuhli_global *g, KUHLI_METHOD m ) {
+kuhli_t *kuhli_init( kuhli_global_t *g, KUHLI_METHOD m ) {
   kuhli_t *k = calloc(sizeof(*k), 1);
   k->method = m;
   k->port = -1;
   k->body_length = -1;
   k->g = g;
-  k->buf = init_buf();
+  k->buf = kuhli_buf_init();
   k->protocol = KUHLI_HTTP;
-  k->next = g->active;
-  g->active = k;
+  k->next = g->kuhli_list;
+  g->kuhli_list = k;
+  k->file = fopen("./reqOut.bin", "w");
   return k;
 }
 
@@ -496,32 +538,32 @@ void kuhli_append( kuhli_t *k, char const *key, char const *value ) {
   }
 }
 
-static void append_param( kuhli_t *k, kuhli_buf_t *buf, char const *key, char const *value ) {
+static void kuhli_append_param( kuhli_t *k, kuhli_buf_t *buf, char const *key, char const *value ) {
   key = curl_easy_escape(k->easy, key, 0);
   value = curl_easy_escape(k->easy, value, 0);
   if(buf->len) {
-    buf_appendf(buf, "&%s=%s", key, value);
+    kuhli_buf_appendf(buf, "&%s=%s", key, value);
   }
   else {
-    buf_appendf(buf, "%s=%s", key, value);
+    kuhli_buf_appendf(buf, "%s=%s", key, value);
   }
 }
 
 void kuhli_append_query( kuhli_t *k, char const *key, char const *value ) {
   if(key && key[0] && value) {
     if(!k->querybuf) {
-      k->querybuf = init_buf();
+      k->querybuf = kuhli_buf_init();
     }
-    append_param(k, k->querybuf, key, value);
+    kuhli_append_param(k, k->querybuf, key, value);
   }
 }
 
 void kuhli_append_form( kuhli_t *k, char const *key, char const *value ) {
   if(key && key[0] && value) {
     if(!k->formbuf) {
-      k->formbuf = init_buf();
+      k->formbuf = kuhli_buf_init();
     }
-    append_param(k, k->formbuf, key, value);
+    kuhli_append_param(k, k->formbuf, key, value);
   }
 }
 
@@ -529,44 +571,50 @@ void kuhli_header( kuhli_t *k, char const *key, char const *value ) {
   if(key && key[0] && value) {
     char buf[1024];
     snprintf(buf, 1024, "%s: %s", key, value);
-    k->headers = curl_slist_append(k->headers, buf);
+    k->out_headers = curl_slist_append(k->out_headers, buf);
   }
 }
 
-void kuhli_write( kuhli_t *k, char const *data, size_t len ) {
-  if(!k->in_progress) {
+int kuhli_write( kuhli_t *k, char const *data, size_t len ) {
+  if(k->finished) {
+    kuhli_add_task(kuhli_init_task(k, TASK_END));
+    return 0;
+  }
+  if(!k->started) {
     k->chunked = 1;
-    add_data_chunk(k, data, len, 1);
-    start_request(k);
+    kuhli_add_data_chunk(k, data, len, 1);
+    kuhli_start_request(k);
   }
   else {
-    kuhli_task_t *t = init_task(k, TASK_WRITE);
+    kuhli_task_t *t = kuhli_init_task(k, TASK_WRITE);
     t->data = malloc(len);
     t->data_len = len;
     memcpy(t->data, data, len);
-    add_task(t);
+    kuhli_add_task(t);
   }
+  return 1;
 }
 
-void kuhli_write_end( kuhli_t *k, char const *data, size_t len ) {
-  if(!k->in_progress) {
+int kuhli_write_end( kuhli_t *k, char const *data, size_t len ) {
+  if(!k->started) {
     k->body_length = len;
-    add_data_chunk(k, data, len, 1);
-    start_request(k);
+    kuhli_add_data_chunk(k, data, len, 1);
+    kuhli_start_request(k);
   }
   else {
     kuhli_write(k, data, len);
     kuhli_end(k);
   }
+  return 1;
 }
 
 void kuhli_end( kuhli_t *k ) {
-  if(!k->in_progress) {
+  if(!k->started) {
     if(k->formbuf) {
       k->body_length = k->formbuf->len;
-      add_data_chunk(k, k->formbuf->buf, k->body_length, 1);
+      kuhli_add_data_chunk(k, k->formbuf->buf, k->body_length, 1);
     }
-    start_request(k);
+    kuhli_start_request(k);
   }
-  add_task(init_task(k, TASK_END));
+  kuhli_add_task(kuhli_init_task(k, TASK_END));
 }
