@@ -107,12 +107,10 @@ static kuhli_buf_t *kuhli_buf_init( void ) {
 }
 
 static void kuhli_buf_destroy( kuhli_buf_t *b ) {
-  free(b->buf);
-  free(b);
-}
-
-static void kuhli_buf_clear( kuhli_buf_t *b ) {
-  b->len = 0;
+  if(b) {
+    free(b->buf);
+    free(b);
+  }
 }
 
 static void kuhli_buf_try_grow( kuhli_buf_t *b, int len ) {
@@ -181,6 +179,23 @@ static kuhli_t *kuhli_remove_from_list( kuhli_global_t *g, CURL *easy ) {
   return res;
 }
 
+static void kuhli_destroy( kuhli_t *k ) {
+  if(k->user_ended && k->finished) {
+    kuhli_buf_destroy(k->querybuf);
+    kuhli_buf_destroy(k->formbuf);
+    kuhli_buf_destroy(k->buf);
+    free(k->path);
+    free(k->host);
+    while(k->in_headers) {
+      void *m = k->in_headers;
+      k->in_headers = k->in_headers->next;
+      free(m);
+    }
+    curl_easy_cleanup(k->easy);
+    free(k);
+  }
+}
+
 static void kuhli_clean_up_finished( kuhli_global_t *g ) {
   /*  see if any easy handles are complete and wrap them up if so  */
   CURLMsg* message = NULL;
@@ -199,12 +214,9 @@ static void kuhli_clean_up_finished( kuhli_global_t *g ) {
       fprintf(stderr, "Curl status: %ld\n", status);
       fprintf(stderr, "Curl Err: %s\n", k->curl_error_buf);
       k->finished = 1;
+      kuhli_destroy(k);
     }
   }
-}
-
-static void kuhli_destroy( kuhli_t *k ) {
-  
 }
 
 static void kuhli_loop_uv_injection( uv_poll_t *p, int status, int events ) {
@@ -258,6 +270,7 @@ static void kuhli_loop_uv_injection( uv_poll_t *p, int status, int events ) {
       case TASK_SHUTDOWN:
 	break;
       }
+      free(t);
     }
   }
 }
@@ -340,14 +353,20 @@ static size_t kuhli_loop_curl_header( char *buf, size_t size, size_t num, void *
 
 static size_t kuhli_loop_curl_write_body( char *buf, size_t size, size_t num, void *opaque ) {
   size_t res = size*num;
-  for(size_t i=0; i<res; i++) {
-    putchar(buf[i]);
+  kuhli_t *k = opaque;
+  if(k->on_body_chunk) {
+    k->on_body_chunk(k, buf, res, k->opaque);
+  }
+  else {
+    for(size_t i=0; i<res; i++) {
+      putchar(buf[i]);
+    }
   }
   return res;
 }
 
 static size_t kuhli_loop_curl_read_body( char *buf, size_t size, size_t num, void *opaque ) {
-  kuhli_t *k = (kuhli_t *)opaque;
+  kuhli_t *k = opaque;
   size_t available_bytes = size*num;
   size_t total_written = 0;
   while(available_bytes && k->body) {
@@ -395,6 +414,18 @@ static void *kuhli_uv_thread( void *arg ) {
   uv_run(&g->loop, UV_RUN_DEFAULT);
   while(uv_loop_close(&g->loop) == UV_EBUSY);
   return NULL;
+}
+
+void kuhli_opaque( kuhli_t *k, void *opaque ) {
+  k->opaque = opaque;
+}
+
+void kuhli_on_body_chunk( kuhli_t *k, kuhli_body_chunk_cb cb ) {
+  k->on_body_chunk = cb;
+}
+
+void kuhli_on_complete( kuhli_t *k, kuhli_complete_cb cb ) {
+  k->on_complete = cb;
 }
 
 kuhli_global_t *kuhli_global_init( void ) {
@@ -458,13 +489,13 @@ static void kuhli_start_request( kuhli_t *k ) {
       kuhli_buf_appendf(k->buf, "?%s", k->querybuf->buf);
     }
     curl_easy_setopt(k->easy, CURLOPT_PRIVATE, k);
-    curl_easy_setopt(k->easy, CURLOPT_VERBOSE, 1L);
+    //curl_easy_setopt(k->easy, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(k->easy, CURLOPT_URL, k->buf->buf);
     curl_easy_setopt(k->easy, CURLOPT_ERRORBUFFER, k->curl_error_buf);
     curl_easy_setopt(k->easy, CURLOPT_HEADERFUNCTION, kuhli_loop_curl_header);
     curl_easy_setopt(k->easy, CURLOPT_HEADERDATA, k);
     curl_easy_setopt(k->easy, CURLOPT_WRITEFUNCTION, kuhli_loop_curl_write_body);
-    curl_easy_setopt(k->easy, CURLOPT_WRITEDATA, NULL );
+    curl_easy_setopt(k->easy, CURLOPT_WRITEDATA, k);
     switch(k->method) {
     case KUHLI_GET:
       curl_easy_setopt(k->easy, CURLOPT_HTTPGET, 1L);
@@ -577,7 +608,6 @@ void kuhli_header( kuhli_t *k, char const *key, char const *value ) {
 
 int kuhli_write( kuhli_t *k, char const *data, size_t len ) {
   if(k->finished) {
-    kuhli_add_task(kuhli_init_task(k, TASK_END));
     return 0;
   }
   if(!k->started) {

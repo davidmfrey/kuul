@@ -29,8 +29,9 @@ extern "C" {
   kuhli_t *kuhli_init( kuhli_global_t *, KUHLI_METHOD );
   
   void kuhli_on_headers( kuhli_t *, kuhli_headers_cb );
-  void kuhli_on_body_chunk( kuhli_t *, kuhli_complete_cb );
-  void kuhli_on_complete( kuhli_t *, kuhli_body_chunk_cb );
+  void kuhli_on_body_chunk( kuhli_t *, kuhli_body_chunk_cb );
+  void kuhli_on_complete( kuhli_t *, kuhli_complete_cb );
+  void kuhli_opaque( kuhli_t *, void *opaque );
   
   void kuhli_protocol( kuhli_t *, KUHLI_PROTOCOL );
   void kuhli_host( kuhli_t *, char const *host );

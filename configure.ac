@@ -1,4 +1,4 @@
-AC_INIT([libkuhli], [0.1], [mattfrey@cisco.com], [])
+AC_INIT([libkuhli], [0.1.1], [mattfrey@cisco.com], [])
 AM_INIT_AUTOMAKE([foreign])
 LT_INIT
 AC_CONFIG_MACRO_DIR([m4])
