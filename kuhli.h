@@ -33,6 +33,8 @@ extern "C" {
   void kuhli_on_complete( kuhli_t *, kuhli_complete_cb );
   void kuhli_opaque( kuhli_t *, void *opaque );
   
+  void kuhli_verbose( kuhli_t *, int );
+  
   void kuhli_protocol( kuhli_t *, KUHLI_PROTOCOL );
   void kuhli_host( kuhli_t *, char const *host );
   void kuhli_port( kuhli_t *, int port );

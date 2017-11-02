@@ -211,8 +211,8 @@ static void kuhli_clean_up_finished( kuhli_global_t *g ) {
       if(k->on_complete) {
 	k->on_complete(k, status, k->opaque);
       }
-      fprintf(stderr, "Curl status: %ld\n", status);
-      fprintf(stderr, "Curl Err: %s\n", k->curl_error_buf);
+      //fprintf(stderr, "Curl status: %ld\n", status);
+      //fprintf(stderr, "Curl Err: %s\n", k->curl_error_buf);
       k->finished = 1;
       kuhli_destroy(k);
     }
