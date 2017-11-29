@@ -84,6 +84,7 @@ struct kuhli_t {
   int port;
   struct curl_slist *out_headers;
   kuhli_header_t *in_headers;
+  int verbose;
   int user_ended;
   int paused;
   int started;
@@ -420,6 +421,10 @@ void kuhli_opaque( kuhli_t *k, void *opaque ) {
   k->opaque = opaque;
 }
 
+void kuhli_verbose( kuhli_t *k, int v ) {
+  k->verbose = v;
+}
+
 void kuhli_on_body_chunk( kuhli_t *k, kuhli_body_chunk_cb cb ) {
   k->on_body_chunk = cb;
 }
@@ -489,7 +494,9 @@ static void kuhli_start_request( kuhli_t *k ) {
       kuhli_buf_appendf(k->buf, "?%s", k->querybuf->buf);
     }
     curl_easy_setopt(k->easy, CURLOPT_PRIVATE, k);
-    //curl_easy_setopt(k->easy, CURLOPT_VERBOSE, 1L);
+    if(k->verbose) {
+      curl_easy_setopt(k->easy, CURLOPT_VERBOSE, 1L);
+    }
     curl_easy_setopt(k->easy, CURLOPT_URL, k->buf->buf);
     curl_easy_setopt(k->easy, CURLOPT_ERRORBUFFER, k->curl_error_buf);
     curl_easy_setopt(k->easy, CURLOPT_HEADERFUNCTION, kuhli_loop_curl_header);
